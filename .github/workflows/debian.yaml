@@ -1,0 +1,541 @@
+---
+name: Debian Git build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        type: choice
+        options: [unstable, trixie, bookworm]
+        description: Debian release
+        default: unstable
+      n-split:
+        type: number
+        description: Stage 2 parallelism
+        default: 8
+      ungoogled:
+        type: boolean
+        description: Convert to ungoogled-chromium
+        default: false
+
+env:
+  BUILD_ENV: RUSTC_BOOTSTRAP=1 DEB_BUILD_ARCH=amd64 DEB_HOST_ARCH=amd64
+  DEBIAN_APT_URL: http://debian-archive.trafficmanager.net/debian
+  DEBIAN_RELEASE: ${{inputs.release}}
+  N_SPLIT: ${{inputs.n-split}}
+  PYTHONDONTWRITEBYTECODE: 1
+  SALSA_GIT_URL: https://salsa.debian.org/chromium-team/chromium.git
+  ZSTD_NBTHREADS: 0
+
+jobs:
+
+  prep-source:
+    runs-on: ubuntu-24.04
+    outputs:
+      split-matrix: ${{steps.split.outputs.matrix}}
+      version: ${{steps.chromium.outputs.version}}
+    steps:
+
+      - name: Check N-way split
+        id: split
+        # https://docs.github.com/en/actions/reference/limits#job-concurrency-limits-for-github-hosted-runners
+        run: |
+          (set -x; test $N_SPLIT -ge 1)
+          (set -x; test $N_SPLIT -le 20)
+          mtx=$(seq 1 $N_SPLIT | awk '{print "part" $1}' | jq -Rn --indent 0 '[ inputs ]')
+          echo "matrix=$mtx" >> $GITHUB_OUTPUT
+          echo "Will split stage 2 of the build $N_SPLIT ways."
+
+      - name: Clone this Git repository
+        uses: actions/checkout@v4
+
+      - name: Clone Salsa Git repository
+        run: |
+          branch=${DEBIAN_RELEASE/unstable/master}
+          exec 2>&1
+          (set -x; git clone --branch=$branch --depth=1 $SALSA_GIT_URL chromium)
+          echo ' '
+          git -C chromium log -n1 | sed 's/^$/ /'
+          commit_id=$(git -C chromium show --format='%H' --no-patch)
+          url=${SALSA_GIT_URL%.git}/-/commit/$commit_id
+          echo "Salsa Git revision: [\`$commit_id\`]($url)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Get Chromium version info
+        id: chromium
+        run: |
+          pkg_version=$(dpkg-parsechangelog -l chromium/debian/changelog -S Version)
+          echo " Package version: $pkg_version"
+          version=${pkg_version%-*}
+          echo "Upstream version: $version"
+          grep -Pq '^\d{3}(\.\d{1,4}){3}$' <<< $version
+          echo CHROMIUM_VERSION=$version >> $GITHUB_ENV
+          echo version=$version >> $GITHUB_OUTPUT
+          echo "Debian package version: \`$pkg_version\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Install required packages
+        run: |
+          exec 2>&1
+          # Lighten the "apt-get update" load
+          sudo rm -fv /etc/apt/apt.conf.d/50appstream
+          sudo rm -fv /etc/apt/apt.conf.d/50command-not-found
+          sudo tee /etc/apt/apt.conf.d/95xtradeb <<< 'Acquire::Languages "none";'
+          sudo rm -fv /etc/apt/sources.list.d/*{azure,microsoft}*
+          echo ' '
+          (set -x; sudo apt-get --error-on=any update)
+          echo ' '
+          set -x
+          sudo apt-get -y --no-install-recommends install \
+            dctrl-tools devscripts quilt
+
+      - name: Restore orig-source tarball cache
+        id: restore-cache
+        uses: actions/cache/restore@v4
+        with:
+          key: chromium-orig-${{steps.chromium.outputs.version}}
+          path: orig-source
+
+      - name: Download source and generate orig-source tarball
+        if: ${{!steps.restore-cache.outputs.cache-hit}}
+        run: |
+          echo 'progress = dot:giga' > ~/.wgetrc
+          (set -x; cd chromium && debian/rules get-orig-source)
+          mkdir -p orig-source
+          mv chromium_*.orig.tar.xz orig-source/
+
+      - name: Save orig-source tarball cache
+        if: ${{!steps.restore-cache.outputs.cache-hit}}
+        uses: actions/cache/save@v4
+        with:
+          key: chromium-orig-${{steps.chromium.outputs.version}}
+          path: orig-source
+
+      - name: Save orig-source tarball artifact
+        if: inputs.release == 'unstable'
+        uses: actions/upload-artifact@v4
+        with:
+          name: orig-source
+          compression-level: 0
+          retention-days: 7
+          path: orig-source
+
+      - name: Apply ungoogled-chromium conversion
+        if: inputs.ungoogled
+        env:
+          UNGOOGLED_CHROMIUM_GIT_URL: https://github.com/ungoogled-software/ungoogled-chromium.git
+          UNGOOGLED_CHROMIUM_DEBIAN_GIT_URL: https://github.com/ungoogled-software/ungoogled-chromium-debian.git
+        run: |
+          exec 2>&1
+          (set -x; git clone --depth=20 $UNGOOGLED_CHROMIUM_GIT_URL u-c)
+          uc_tag=$(git -C u-c tag --list --sort=version:refname "$CHROMIUM_VERSION-*" | tail -n1)
+          if [ -z "$uc_tag" ]
+          then
+            echo "Error: No ungoogled-chromium release found for Chromium version $CHROMIUM_VERSION"
+            exit 1
+          fi
+          url="${UNGOOGLED_CHROMIUM_GIT_URL%.git}/releases/tag/$uc_tag"
+          echo "Ungoogled-chromium tag: [\`$uc_tag\`]($url)" >> $GITHUB_STEP_SUMMARY
+          uc_rev=${uc_tag##*-}
+          echo ' '
+          (set -x; git -C u-c switch -d $uc_tag)
+          echo ' '
+          (set -x; git clone --depth=1 $UNGOOGLED_CHROMIUM_DEBIAN_GIT_URL u-c-debian)
+          echo ' '
+          (cd orig-source && x=$(echo chromium_*.orig.tar.xz) && mv -v $x ungoogled-$x)
+          set -x
+          mkdir -p u-c-work/src
+          (cd u-c-work/src && tar xJf \
+             ../../orig-source/ungoogled-chromium_*.orig.tar.xz \
+             --strip-components=1)
+          ln -s ../../chromium/debian u-c-work/src/
+          cd u-c-work
+          make -f ../u-c-debian/convert/Makefile \
+            check-git convert \
+            VERSION=$CHROMIUM_VERSION \
+            ORIG_SOURCE=src \
+            UNGOOGLED=../u-c \
+            DEBIAN_CONVERT=../u-c-debian/convert \
+            ADD_VERSION_SUFFIX=.$uc_rev \
+            DISTRIBUTION= \
+            INPLACE=1
+          rm -rf u-c-work
+
+      - name: Patch dpkg to speed up source package build
+        run: (cd / && sudo patch -p1) < misc/dpkg-source-build.patch 2>&1
+
+      - name: Generate source package (${{inputs.release}})
+        run: |
+          exec 2>&1
+          ln -s orig-source/*.orig.tar.xz .
+          (set -x; dpkg-source --no-preparation --no-generate-diff --build chromium)
+          mkdir srcpkg
+          mv *.{dsc,debian.tar.xz} srcpkg/
+
+      - name: Save source package artifact (${{inputs.release}})
+        uses: actions/upload-artifact@v4
+        with:
+          name: srcpkg-${{steps.chromium.outputs.version}}-${{inputs.release}}
+          compression-level: 0
+          retention-days: 7
+          path: srcpkg
+
+  stage-1:
+    needs: [prep-source]
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:${{inputs.release}}
+      options: -v /:/HOST
+    defaults:
+      run:
+        shell: bash
+    steps:
+
+      - name: Clone this Git repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: cd /HOST && $GITHUB_WORKSPACE/misc/purge-runner.sh
+
+      # Use the host binary instead of installing a package
+      - name: Set up zstd
+        run: |
+          exec 2>&1; set -x
+          ln -s /HOST/usr/bin/zstd /usr/local/bin/
+          ln -s zstd /usr/local/bin/unzstd
+          zstd --version
+
+      - name: Update APT config
+        run: |
+          exec 2>&1
+          # Re-enable the APT package cache
+          rm -fv /etc/apt/apt.conf.d/docker-clean
+          # Use an Azure-local Debian mirror
+          echo "Using Debian APT mirror: $DEBIAN_APT_URL"
+          perl -pi \
+            -e '/^(deb|URIs:)/ or next;' \
+            -e "s!https?://deb\\.debian\\.org/debian!$DEBIAN_APT_URL!;" \
+            /etc/apt/sources.list.d/debian.sources
+
+      - name: Install required build-tooling packages
+        run: |
+          exec 2>&1
+          (set -x; apt-get --error-on=any update)
+          echo ' '
+          set -x
+          apt-get -y install devscripts equivs
+
+      - name: Restore orig-source tarball cache
+        uses: actions/cache/restore@v4
+        with:
+          key: chromium-orig-${{needs.prep-source.outputs.version}}
+          path: orig-source
+          fail-on-cache-miss: true
+
+      - name: Download source package artifact (${{inputs.release}})
+        uses: actions/download-artifact@v4
+        with:
+          name: srcpkg-${{needs.prep-source.outputs.version}}-${{inputs.release}}
+          path: srcpkg
+
+      - name: Unpack sources
+        env:
+          UNGOOGLED: ${{inputs.ungoogled}}
+        run: |
+          exec 2>&1
+          (cd srcpkg && ln -s ../orig-source/*.orig.tar.xz .)
+          test "_$UNGOOGLED" != _true \
+          || (cd srcpkg && x=$(echo chromium_*.orig.tar.xz) && mv -v $x ungoogled-$x)
+          (set -x; dpkg-source --no-copy --extract srcpkg/*.dsc _build)
+          sleep 1.1
+          touch _build/.extract.stamp
+          echo ' '
+          (set -x; cd _build && dpkg-parsechangelog -c1)
+
+      - name: Install build dependencies
+        run: |
+          exec 2>&1
+          mkdir -p _setup
+          cd _setup
+          (set -x; mk-build-deps ../_build/debian/control)
+          echo ' '
+          (set -x; apt-get -y --no-install-recommends install \
+             ./*-build-deps_*.deb dbus-user-session:\*-)
+          # Save a copy of the APT config, repo lists, and package cache
+          cp -p /etc/apt/sources.list.d/debian.sources .
+          cp -a /var/lib/apt/lists .
+          cp -a /var/cache/apt/archives .
+
+      - name: Configure build tree
+        run: |
+          exec 2>&1
+          mkdir /tmp/hack
+          cat > /tmp/hack/ninja << 'END'
+          #!/bin/sh
+          if [ " $2 $3" != ' -C out/Release' ]
+          then
+            echo 'ninja-hack: error: unexpected arguments'
+            exit 1
+          fi
+          shift 3
+          echo $* > /tmp/build.targets
+          echo 'ninja-hack: exiting build early, not an error'
+          exit 42
+          END
+          chmod u+x /tmp/hack/ninja
+          cd _build
+          ret=0
+          (PATH=/tmp/hack:$PATH; set -x; dpkg-buildpackage --build=binary) || ret=$?
+          test $ret -ne 0 -a -f /tmp/build.targets || exit
+
+      - name: Prepare GHCI build strategy
+        run: |
+          exec 2>&1
+          cd _build/out/Release
+          targets=$(cat /tmp/build.targets)
+          set -x
+          ../../../ghci-strategy.sh $N_SPLIT $targets
+          find . -type f -name \*.ninja.orig -delete
+
+      - name: Stage 1 build
+        run: |
+          exec 2>&1; set -o pipefail
+          (cd _build && set -x && env $BUILD_ENV \
+           ninja -C out/Release -f ghci-stage1.ninja ghci-stage1 \
+          ) 2>&1 | misc/ninja-filter.pl
+          (cd _build/out/Release && mv -f .ninja_log ghci-stage1.ninja_log)
+
+      - name: Tar up the workspace
+        run: |
+          exec 2>&1; set -x
+          tar cf stage1.tar.zstd --zstd _setup _build
+          ls -lh stage1.tar.zstd
+
+      - name: Save the workspace for stage 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1
+          compression-level: 0
+          path: stage1.tar.zstd
+          if-no-files-found: error
+          retention-days: 1
+
+  stage-2:
+    needs: [prep-source, stage-1]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        part: ${{fromJSON(needs.prep-source.outputs.split-matrix)}}
+    container:
+      image: debian:${{inputs.release}}
+      options: -v /:/HOST
+    env:
+      PART: ${{matrix.part}}
+    steps:
+
+      - name: Clone this Git repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: cd /HOST && $GITHUB_WORKSPACE/misc/purge-runner.sh
+
+      - name: Set up zstd
+        run: |
+          exec 2>&1; set -x
+          ln -s /HOST/usr/bin/zstd /usr/local/bin/
+          ln -s zstd /usr/local/bin/unzstd
+          zstd --version
+
+      - name: Download workspace tarball from stage 1
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1
+
+      # The find+truncate gets rid of the bulk of redundant files under
+      # obj/, while keeping them as placeholders to avoid recompilation
+      - name: Unpack workspace tarball
+        run: |
+          exec 2>&1
+          (set -x; tar xf stage1.tar.zstd --zstd)
+          rm stage1.tar.zstd
+          cd _build/out/Release
+          find obj */obj -type f -exec truncate -s0 {} +
+
+      - name: Install build dependencies
+        run: |
+          exec 2>&1
+          cd _setup
+          mv -f debian.sources /etc/apt/sources.list.d/
+          rm -rf /var/lib/apt/lists
+          mv lists /var/lib/apt/
+          rm -rf /var/cache/apt/archives
+          mv archives /var/cache/apt/
+          set -x
+          apt-get -y --no-install-recommends install \
+            ./*-build-deps_*.deb dbus-user-session:\*-
+
+      - name: Stage 2 build (${{matrix.part}})
+        run: |
+          exec 2>&1
+          cd _build
+          (set -x; env $BUILD_ENV ninja -C out/Release -f ghci-stage2.ninja $PART)
+          (cd out/Release && mv -f .ninja_log ghci-stage2-$PART.ninja_log)
+
+      - name: Tar up the partial build tree
+        run: |
+          exec 2>&1; set -x
+          tar cf stage2-$PART.tar.zstd --zstd \
+            _build/out/Release/ghci-stage2-*.ninja_log \
+            _build/out/Release/obj \
+            _build/out/Release/*/obj
+          ls -lh stage2-$PART.tar.zstd
+
+      - name: Save the partial tree for stage 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-${{matrix.part}}
+          compression-level: 0
+          path: stage2-${{matrix.part}}.tar.zstd
+          if-no-files-found: error
+          retention-days: 1
+
+  stage-3:
+    needs: [prep-source, stage-1, stage-2]
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:${{inputs.release}}
+      options: -v /:/HOST
+    steps:
+
+      - name: Clone this Git repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: cd /HOST && $GITHUB_WORKSPACE/misc/purge-runner.sh
+
+      - name: Set up zstd
+        run: |
+          exec 2>&1; set -x
+          ln -s /HOST/usr/bin/zstd /usr/local/bin/
+          ln -s zstd /usr/local/bin/unzstd
+          zstd --version
+
+      - name: Download the workspace and partial build tree tarballs
+        uses: actions/download-artifact@v4
+
+      - name: Unpack the tarballs
+        run: |
+          exec 2>&1
+          for tarball in \
+            stage1/stage1.tar.zstd \
+            stage2-part*/stage2-part*.tar.zstd
+          do
+            (set -x; tar xf $tarball --zstd --skip-old-files)
+            rm $tarball
+          done
+          rmdir stage1 stage2-part*
+
+      - name: Install build dependencies
+        run: |
+          exec 2>&1
+          cd _setup
+          mv -f debian.sources /etc/apt/sources.list.d/
+          rm -rf /var/lib/apt/lists
+          mv lists /var/lib/apt/
+          rm -rf /var/cache/apt/archives
+          mv archives /var/cache/apt/
+          set -x
+          apt-get -y --no-install-recommends install \
+            ./*-build-deps_*.deb dbus-user-session:\*-
+
+      - name: Stage 3 build
+        run: |
+          exec 2>&1; set -o pipefail
+          mkdir /tmp/hack
+          cat > /tmp/hack/gn << 'END'
+          #!/bin/sh
+          test "_$1" = _gen || exit
+          echo 'gn-hack: ignoring "gn gen" invocation'
+          exit 0
+          END
+          chmod u+x /tmp/hack/gn
+          (PATH=/tmp/hack:$PATH; cd _build && set -x && \
+           dpkg-buildpackage --no-pre-clean --build=binary \
+          ) 2>&1 | misc/ninja-filter.pl
+          (cd _build/out/Release && mv -f .ninja_log ghci-stage3.ninja_log)
+          echo ' '
+          ls -l *.deb
+          echo ' '
+          echo 'SHA-256 sums:'
+          sha256sum *.deb
+
+      - name: Save binary packages artifact (${{inputs.release}})
+        uses: actions/upload-artifact@v4
+        with:
+          name: binpkg-${{needs.prep-source.outputs.version}}-${{inputs.release}}
+          compression-level: 0
+          path: ./*.deb
+          if-no-files-found: error
+
+      - name: Tar up build tree
+        if: always() && ! cancelled()
+        run: |
+          exec 2>&1; set -x
+          tar cf build-tree.tar.zstd --zstd \
+            --newer-mtime ./_build/.extract.stamp _build
+
+      - name: Save build-tree artifact
+        if: always() && ! cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-tree
+          compression-level: 0
+          path: build-tree.tar.zstd
+          retention-days: 2
+
+      - name: Collect build info
+        env:
+          CHROMIUM_VERSION: ${{needs.prep-source.outputs.version}}
+        run: |
+          exec 2>&1
+          mkdir build-info
+          cp -p _build/out/Release/ghci-*.ninja_log build-info/
+          (cd _build && ../misc/build-sums.sh) > build-info/md5sums.txt
+          dpkg-query --show > build-info/dpkg-installed.txt
+
+      - name: Save build-info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          compression-level: 9
+          path: build-info
+          if-no-files-found: error
+
+  cleanup:
+    if: always()
+    needs: [stage-3]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Delete temporary artifacts
+        env:
+          GH_TOKEN: ${{github.token}}
+        run: |
+          gh_api_call()
+          {
+            gh api $2 $3 \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/$GITHUB_REPOSITORY/actions/$1"
+          }
+          gh_api_call "runs/$GITHUB_RUN_ID/artifacts" \
+          | jq -r '.artifacts[] | (.id|tostring)+"\t"+.name' \
+          | grep stage \
+          > artifacts.txt || true
+          echo "Found $(wc -l < artifacts.txt) artifact(s) to delete."
+          while read id name
+          do
+            echo "Deleting artifact \"$name\" (id=$id)"
+            gh_api_call "artifacts/$id" --method DELETE
+          done < artifacts.txt
+
+# end build.yaml
